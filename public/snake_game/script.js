@@ -1,22 +1,148 @@
 const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
 
-const COLS = 24;
-const ROWS = 24;
-const CELL = 20;
+const COLS = 30;
+const ROWS = 30;
+const CELL = 22;
 canvas.width = COLS * CELL;
 canvas.height = ROWS * CELL;
 
-// Target audio tags loaded from HTML
 const eatSound = document.getElementById('eatSound');
 const gameOverSound = document.getElementById('gameOverSound');
 
 let snake, dir, nextDir, food, score, level, speed, running, paused;
-let lastTickTime = 0; // For smooth modern frame accumulation tracking
-
 let highScore = 0;
 let isGameOver = false;
 let finalScore = 0;
+let gameStartTime = 0;
+let gameSurvivalTime = 0;
+
+// Statistics
+let stats = {
+  gamesPlayed: 0,
+  totalScore: 0,
+  highestScore: 0,
+  totalFood: 0,
+  longestSurvival: 0 // in seconds
+};
+
+// Achievements
+const achievements = [
+  { id: 'beginner-snake', name: 'Beginner Snake', desc: 'Score 20 points', icon: '🐍', check: () => score >= 20 },
+  { id: 'growing-hunter', name: 'Growing Hunter', desc: 'Score 50 points', icon: '👑', check: () => score >= 50 },
+  { id: 'snake-master', name: 'Snake Master', desc: 'Score 100 points', icon: '🏆', check: () => score >= 100 },
+  { id: 'snake-legend', name: 'Snake Legend', desc: 'Score 200 points', icon: '🔥', check: () => score >= 200 }
+];
+let unlockedAchievements = new Set();
+
+// RAF state
+let rafId = null;
+let lastTickTime = 0;
+
+// Page visibility
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (running && !paused) {
+      setPaused(true);
+      paused_by_visibility = true;
+    }
+  } else {
+    if (paused_by_visibility) {
+      setPaused(false);
+      paused_by_visibility = false;
+    }
+  }
+});
+let paused_by_visibility = false;
+
+function setPaused(value) {
+  paused = value;
+  const overlay = document.getElementById('pauseOverlay');
+  if (overlay) {
+    value ? overlay.classList.remove('hidden') : overlay.classList.add('hidden');
+  }
+  if (!value) {
+    lastTickTime = performance.now();
+  }
+}
+
+// Web Audio sound engine
+let audioCtx = null;
+
+function getAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+function playTone(freq, type = 'square', duration = 0.08, gainPeak = 0.18) {
+  try {
+    const ac = getAudioCtx();
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ac.currentTime);
+
+    gain.gain.setValueAtTime(0, ac.currentTime);
+    gain.gain.linearRampToValueAtTime(gainPeak, ac.currentTime + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + duration);
+
+    osc.connect(gain);
+    gain.connect(ac.destination);
+    osc.start(ac.currentTime);
+    osc.stop(ac.currentTime + duration + 0.01);
+  } catch (e) {}
+}
+
+function soundEat() {
+  playTone(440, 'square', 0.06, 0.15);
+  setTimeout(() => playTone(660, 'square', 0.08, 0.12), 40);
+}
+
+function soundLevelUp() {
+  [330, 440, 550, 660].forEach((f, i) =>
+    setTimeout(() => playTone(f, 'square', 0.12, 0.14), i * 60)
+  );
+}
+
+function soundDie() {
+  [220, 180, 140, 100].forEach((f, i) =>
+    setTimeout(() => playTone(f, 'sawtooth', 0.12, 0.20), i * 70)
+  );
+}
+
+// Initialize
+function loadGameData() {
+  try {
+    const savedStats = localStorage.getItem('snake-stats');
+    if (savedStats) {
+      stats = JSON.parse(savedStats);
+    }
+    const savedHighScore = localStorage.getItem('snake-highscore');
+    if (savedHighScore) {
+      highScore = parseInt(savedHighScore);
+    }
+    const savedAchievements = localStorage.getItem('snake-achievements');
+    if (savedAchievements) {
+      unlockedAchievements = new Set(JSON.parse(savedAchievements));
+    }
+  } catch (e) {
+    console.error('Error loading data from localStorage:', e);
+  }
+}
+
+function saveGameData() {
+  try {
+    localStorage.setItem('snake-stats', JSON.stringify(stats));
+    localStorage.setItem('snake-highscore', highScore.toString());
+    localStorage.setItem('snake-achievements', JSON.stringify([...unlockedAchievements]));
+  } catch (e) {
+    console.error('Error saving data to localStorage:', e);
+  }
+}
 
 function initGame() {
   const startX = Math.floor(COLS / 2);
@@ -26,15 +152,20 @@ function initGame() {
     { x: startX - 1, y: startY },
     { x: startX - 2, y: startY },
   ];
+
   dir = { x: 1, y: 0 };
   nextDir = { x: 1, y: 0 };
   score = 0;
   level = 1;
   speed = 160;
   running = false;
-  paused = false;
+  isGameOver = false;
+  setPaused(false);
+
   placeFood();
   updateHUD();
+  updateStatsUI();
+  renderAchievements();
 }
 
 function placeFood() {
@@ -65,6 +196,56 @@ function updateHUD(bumped) {
       el.addEventListener('transitionend', () => el.classList.remove('bump'), { once: true });
     });
   }
+}
+
+function updateStatsUI() {
+  document.getElementById('stat-games-played').textContent = stats.gamesPlayed;
+  document.getElementById('stat-highest-score').textContent = stats.highestScore;
+  document.getElementById('stat-average-score').textContent = stats.gamesPlayed > 0 
+    ? Math.round(stats.totalScore / stats.gamesPlayed) 
+    : 0;
+  document.getElementById('stat-total-food').textContent = stats.totalFood;
+  document.getElementById('stat-longest-survival').textContent = stats.longestSurvival + 's';
+}
+
+function renderAchievements() {
+  const container = document.getElementById('achievements-list');
+  container.innerHTML = achievements.map(achievement => {
+    const isUnlocked = unlockedAchievements.has(achievement.id);
+    return `
+      <div class="achievement ${isUnlocked ? 'unlocked' : 'locked'}" data-id="${achievement.id}">
+        <div class="achievement-icon">${achievement.icon}</div>
+        <div class="achievement-info">
+          <div class="achievement-name">${achievement.name}</div>
+          <div class="achievement-desc">${achievement.desc}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function showAchievementNotification(achievement) {
+  const notification = document.getElementById('achievement-notification');
+  notification.innerHTML = `
+    <div class="notification-title">Achievement Unlocked!</div>
+    <div class="notification-achievement">${achievement.icon} ${achievement.name}</div>
+  `;
+  notification.classList.remove('hidden');
+  
+  setTimeout(() => {
+    notification.classList.add('hidden');
+  }, 4000);
+}
+
+function checkAchievements() {
+  achievements.forEach(achievement => {
+    if (!unlockedAchievements.has(achievement.id) && achievement.check()) {
+      unlockedAchievements.add(achievement.id);
+      saveGameData();
+      renderAchievements();
+      showAchievementNotification(achievement);
+    }
+  });
 }
 
 function draw() {
@@ -127,8 +308,6 @@ function draw() {
 }
 
 function tick() {
-  if (!running || paused) return;
-
   dir = { ...nextDir };
 
   const head = {
@@ -147,12 +326,11 @@ function tick() {
   }
 
   snake.unshift(head);
-
   if (head.x === food.x && head.y === food.y) {
     score += level * 10;
     if (score > highScore) highScore = score;
+    stats.totalFood++;
 
-    // Play EAT Sound Effect smoothly
     if (eatSound) {
       eatSound.currentTime = 0;
       eatSound.play().catch(err => console.log("Audio play blocked by browser config", err));
@@ -163,9 +341,13 @@ function tick() {
     if (newLevel !== level) {
       level = newLevel;
       speed = Math.max(60, 150 - (level - 1) * 15);
+      soundLevelUp();
+    } else {
+      soundEat();
     }
 
     updateHUD(true);
+    checkAchievements();
     placeFood();
   } else {
     snake.pop();
@@ -173,21 +355,22 @@ function tick() {
   }
 }
 
-// Single Game Loop Engine using high precision requestAnimationFrame (Fixes choppy lag)
 function gameEngine(timestamp) {
   if (!lastTickTime) lastTickTime = timestamp;
 
   if (running && !paused) {
     const elapsed = timestamp - lastTickTime;
-    if (elapsed >= speed) {
+
+    if (elapsed > speed * 3) {
+      lastTickTime = timestamp;
+    } else if (elapsed >= speed) {
       tick();
       lastTickTime = timestamp;
     }
   } else {
-    lastTickTime = timestamp; // Keep synced while resting
+    lastTickTime = timestamp;
   }
 
-  // Draw continuously for buttery smooth animations
   if (!isGameOver) {
     draw();
   }
@@ -202,7 +385,8 @@ function startGame() {
   isGameOver = false;
   initGame();
   running = true;
-  lastTickTime = 0;
+  gameStartTime = Date.now();
+  lastTickTime = performance.now();
 
   document.removeEventListener('keydown', handleKeyDown);
   document.addEventListener('keydown', handleKeyDown);
@@ -212,10 +396,23 @@ function endGame() {
   finalScore = score;
   running = false;
   isGameOver = true;
+  
+  // Update stats
+  gameSurvivalTime = Math.floor((Date.now() - gameStartTime) / 1000);
+  stats.gamesPlayed++;
+  stats.totalScore += score;
+  if (score > stats.highestScore) {
+    stats.highestScore = score;
+  }
+  if (gameSurvivalTime > stats.longestSurvival) {
+    stats.longestSurvival = gameSurvivalTime;
+  }
+  
+  saveGameData();
+  updateStatsUI();
 
   document.removeEventListener('keydown', handleKeyDown);
 
-  // Play GAME OVER sound asset
   if (gameOverSound) {
     gameOverSound.currentTime = 0;
     gameOverSound.play().catch(err => console.log("Audio play blocked", err));
@@ -237,7 +434,7 @@ function endGame() {
       document.getElementById('finalScore').textContent = `SCORE: ${finalScore}  |  BEST: ${highScore}`;
       document.getElementById('gameOverOverlay').classList.remove('hidden');
     }
-  }, 120); // Steady interval rate clears excessive flickering
+  }, 120);
 }
 
 const KEY_MAP = {
@@ -275,28 +472,36 @@ function handleKeyDown(e) {
     }
   }
 
-  if (e.key === ' ' && running) {
-    paused = !paused;
+  if ((e.key === 'p' || e.key === 'P') && running) {
+    e.preventDefault();
+    setPaused(!paused);
   }
 }
 
 document.addEventListener('keydown', handleKeyDown);
+
 document.getElementById('startBtn').addEventListener('click', startGame);
 document.getElementById('restartBtn').addEventListener('click', startGame);
+document.getElementById('reset-stats').addEventListener('click', () => {
+  stats = {
+    gamesPlayed: 0,
+    totalScore: 0,
+    highestScore: 0,
+    totalFood: 0,
+    longestSurvival: 0
+  };
+  highScore = 0;
+  saveGameData();
+  updateStatsUI();
+  updateHUD();
+});
 
-// Initialize game config and start single loop engine
-initGame();
-requestAnimationFrame(gameEngine);
-
-// ========== MOBILE TOUCH CONTROLS ==========
+// Mobile controls
 (function () {
-  const mobileCanvas = document.getElementById('gameCanvas');
   const controls = document.getElementById('mobileControls');
-
   if (!controls) return;
 
   let lastTouch = 0;
-  let startX = 0, startY = 0;
 
   const setDir = (direction) => {
     if (typeof isGameOver !== 'undefined' && isGameOver) return;
@@ -320,61 +525,26 @@ requestAnimationFrame(gameEngine);
         startGame();
       }
       if (typeof nextDir !== 'undefined' && typeof dir !== 'undefined') {
-        if (newDir.x !== -dir.x || newDir.y !== -dir.y) {
-          nextDir = newDir;
-        }
+        if (newDir.x !== -dir.x || newDir.y !== -dir.y) nextDir = newDir;
       }
       return;
     }
 
-    if (typeof running !== 'undefined' && running && typeof paused !== 'undefined' && !paused) {
+    if (typeof running !== 'undefined' && running &&
+        typeof paused  !== 'undefined' && !paused) {
       if (typeof dir !== 'undefined' && typeof nextDir !== 'undefined') {
         if (newDir.x !== -dir.x || newDir.y !== -dir.y) {
           nextDir = newDir;
-          if ('vibrate' in navigator) {
-            navigator.vibrate(20);
-          }
+          if ('vibrate' in navigator) navigator.vibrate(20);
         }
       }
     }
   };
 
-  const buttons = document.querySelectorAll('.dpad-btn');
-  buttons.forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.preventDefault();
-      setDir(btn.dataset.dir);
-    });
-    btn.addEventListener('touchstart', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      setDir(btn.dataset.dir);
-    });
+  document.querySelectorAll('.dpad-btn').forEach(btn => {
+    btn.addEventListener('click', e => { e.preventDefault(); setDir(btn.dataset.dir); });
+    btn.addEventListener('touchstart', e => { e.preventDefault(); e.stopPropagation(); setDir(btn.dataset.dir); });
   });
-
-  if (mobileCanvas) {
-    mobileCanvas.addEventListener('touchstart', (e) => {
-      e.preventDefault();
-      startX = e.touches[0].clientX;
-      startY = e.touches[0].clientY;
-    }, { passive: false });
-
-    mobileCanvas.addEventListener('touchend', (e) => {
-      e.preventDefault();
-      const dx = e.changedTouches[0].clientX - startX;
-      const dy = e.changedTouches[0].clientY - startY;
-
-      if (Math.abs(dx) < 30 && Math.abs(dy) < 30) return;
-
-      const swipe = Math.abs(dx) > Math.abs(dy)
-        ? (dx > 0 ? 'right' : 'left')
-        : (dy > 0 ? 'down' : 'up');
-
-      setDir(swipe);
-    });
-
-    mobileCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
-  }
 
   const isMobile = () => window.innerWidth <= 768 || 'ontouchstart' in window;
   const toggle = () => {
@@ -385,5 +555,31 @@ requestAnimationFrame(gameEngine);
 
   toggle();
   window.addEventListener('resize', toggle);
-  console.log('✅ Mobile touch controls loaded');
 })();
+
+// Theme toggle
+const themeToggle = document.getElementById("themeToggle");
+let isLight = localStorage.getItem("theme") === "light";
+
+function applyTheme() {
+  if (isLight) {
+    document.body.classList.add("light");
+    themeToggle.textContent = "☀️ Light Mode";
+  } else {
+    document.body.classList.remove("light");
+    themeToggle.textContent = "🌙 Dark Mode";
+  }
+}
+
+applyTheme();
+
+themeToggle.addEventListener("click", () => {
+  isLight = !isLight;
+  localStorage.setItem("theme", isLight ? "light" : "dark");
+  applyTheme();
+});
+
+// Load data and start
+loadGameData();
+initGame();
+requestAnimationFrame(gameEngine);
